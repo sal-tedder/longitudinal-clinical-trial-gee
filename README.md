@@ -47,7 +47,8 @@ The three working correlation structures produced nearly identical coefficient e
 
 ## Full Analysis
 
-**[View the complete statistical analysis report](analysis.html)**
+
+**[View the complete statistical analysis report](https://sal-tedder.github.io/longitudinal-clinical-trial-gee/analysis.html)**
 
 The HTML report contains the detailed methodology, hypothesis tests, tables, figures, interpretations, and limitations.
 

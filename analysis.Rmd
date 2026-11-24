@@ -1,0 +1,615 @@
+---
+title: "Longitudinal Clinical Trial Analysis Using GEE"
+author: "Salvatore Tedder"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+library(geepack)
+library(dplyr)
+library(ggplot2)
+source("R/modeling.R")
+depression_data <- load_depression_data()
+```
+
+## Executive Summary
+
+This project evaluates the effectiveness of a new depression treatment relative to a standard treatment using longitudinal clinical trial data and Generalized Estimating Equations (GEE).
+
+The dataset consists of 1,020 observations from 340 patients, each evaluated after 1, 2, and 4 weeks of treatment. Logistic GEE models were fitted using independence, exchangeable, and first-order autoregressive (AR(1)) working correlation structures.
+
+The analysis identified a statistically significant treatment-by-time interaction, indicating that the relative treatment effect changed over the follow-up period. Using the AR(1) model, the estimated treatment odds ratios were 1.07, 2.17, and 8.93 at weeks 1, 2, and 4, respectively. The 95% confidence intervals indicated statistically significant treatment differences at weeks 2 and 4, but not at week 1.
+
+The three working correlation structures produced nearly identical coefficient estimates and statistical conclusions, suggesting that the findings were relatively insensitive to the assumed within-patient correlation structure.
+
+Overall, the results suggest an increasing relative advantage of the new treatment over the four-week follow-up period and demonstrate the application of longitudinal statistical modeling, statistical inference, and model sensitivity analysis in R.
+
+## Introduction and Research Objective
+
+This project examines the effectiveness of a new drug compared with a standard drug for treating depression using longitudinal clinical trial data.
+
+Patients were randomly assigned to one of two treatment groups, and their depression outcomes were evaluated after 1, 2, and 4 weeks. The primary objective is to determine whether the association between treatment and the probability of a normal depression outcome changes over time while accounting for baseline depression severity and repeated measurements within patients.
+
+Generalized Estimating Equations (GEE) are used to model the binary outcomes under three working correlation structures: independence, exchangeable, and first-order autoregressive (AR(1)). The analysis also evaluates the sensitivity of the model estimates to the assumed correlation structure and estimates treatment effects at each follow-up visit.
+
+## Data Description
+
+### Study Design and Variables
+
+The dataset contains observations from a randomized clinical trial comparing a new drug with a standard drug for treating depression. Patients were assigned to one of the two treatments, and their depression outcomes were evaluated after 1, 2, and 4 weeks.
+
+Baseline depression severity was classified as mild or severe. At each follow-up visit, the patient's depression outcome was classified as normal or abnormal.
+
+The dataset contains five variables:
+
+| Variable | Description |
+|---|---|
+| `case` | Unique patient identifier |
+| `severity` | Baseline depression severity (0 = mild, 1 = severe) |
+| `drug` | Treatment assignment (0 = standard drug, 1 = new drug) |
+| `time` | Follow-up time in weeks (1, 2, or 4) |
+| `outcome` | Depression outcome (0 = abnormal, 1 = normal) |
+
+Because each patient contributes repeated observations, measurements from the same patient may be correlated. This longitudinal structure motivates the use of statistical methods that account for within-patient dependence.
+
+### Dataset Characteristics
+
+```{r dataset-characteristics}
+# Dataset dimensions
+dim(depression_data)
+
+# Number of unique patients
+n_distinct(depression_data$case)
+
+# Number of observations per patient
+table(table(depression_data$case))
+
+# Treatment group allocation
+print(
+  depression_data |>
+    distinct(case, drug) |>
+    count(drug)
+)
+
+# Missing values by variable
+colSums(is.na(depression_data))
+```
+
+The dataset contains 1,020 observations from 340 patients, with each patient measured at three follow-up visits. Of the 340 patients, 180 received the standard drug and 160 received the new drug. There are no missing values in the dataset, and every patient has three recorded observations, indicating a complete longitudinal dataset for the variables analyzed.
+
+## Exploratory Data Analysis
+
+### Observed Outcome Proportions by Treatment and Time
+
+```{r outcome-summary}
+outcome_summary <- depression_data |>
+  group_by(drug, time) |>
+  summarise(
+    n = n(),
+    normal_outcomes = sum(outcome == 1),
+    proportion_normal = mean(outcome == 1),
+    .groups = "drop"
+  )
+
+print(outcome_summary)
+```
+
+The observed proportion of patients with a normal outcome increased over time in both treatment groups. At week 1, the proportions were similar (34.4% for the standard drug and 33.1% for the new drug). By week 2, the new drug group had a higher proportion of normal outcomes (62.5% versus 41.7%), and this difference increased further by week 4 (89.4% versus 55.6%).
+
+These descriptive results suggest that the new drug may be associated with greater improvement over the follow-up period. Further statistical modeling is needed to evaluate the treatment effect while accounting for baseline severity and repeated measurements within patients.
+
+```{r outcome-plot}
+outcome_plot <- outcome_summary |>
+  mutate(
+    treatment = factor(
+      drug,
+      levels = c(0, 1),
+      labels = c("Standard Drug", "New Drug")
+    )
+  ) |>
+  ggplot(aes(
+    x = time,
+    y = proportion_normal,
+    color = treatment,
+    group = treatment
+  )) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 3) +
+  scale_x_continuous(breaks = c(1, 2, 4)) +
+  scale_y_continuous(
+    labels = scales::label_percent(),
+    limits = c(0, 1)
+  ) +
+  labs(
+    title = "Normal Depression Outcomes by Treatment",
+    subtitle = "Observed Proportions Across Follow-Up Visits",
+    x = "Week",
+    y = "Proportion with Normal Outcome",
+    color = "Treatment"
+  ) +
+  theme_minimal(base_size = 12)
+
+print(outcome_plot)
+```
+
+## Statistical Methodology
+
+### Generalized Estimating Equations
+
+Generalized Estimating Equations (GEE) are used to analyze the repeated binary outcomes while accounting for potential correlation between observations from the same patient. Unlike ordinary logistic regression, which assumes independent observations, GEE accommodates within-patient dependence and estimates population-averaged regression effects.
+
+A binomial distribution with a logit link is specified because the response variable is binary. The model includes baseline depression severity, treatment assignment, follow-up time, and an interaction between treatment and time. The interaction allows the relative treatment effect to change over the follow-up period.
+
+For $p=P(outcome=1)$, the model is
+
+$$
+\operatorname{logit}(p) = \beta_0 + \beta_1 s + \beta_2 d + \beta_3 t + \beta_4 dt.
+$$
+
+Here, \(p=P(Y=1)\) represents the probability of a normal depression outcome. The predictors \(s\), \(d\), and \(t\) represent baseline severity, treatment assignment, and follow-up time in weeks, respectively. The interaction term \(dt\) allows the treatment effect to vary over time.
+
+The regression coefficients describe population-averaged effects on the log-odds scale. In particular, \(\beta_4\) represents the difference between treatment groups in the change in log-odds per additional week, holding baseline severity constant.
+
+### Working Correlation Structures
+
+Three working correlation structures are considered to evaluate the sensitivity of the GEE estimates to assumptions about within-patient dependence.
+
+**Independence:** Assumes zero working correlation between repeated observations from the same patient. GEE can still use robust standard errors to account for within-patient dependence.
+
+**Exchangeable:** Assumes a constant working correlation between every pair of observations from the same patient, regardless of the time separating them.
+
+**First-order autoregressive (AR(1)):** Assumes that the working correlation between observations decreases geometrically as the number of measurement intervals separating them increases.
+
+The three structures are fitted using the same response variable, predictors, and logit link, allowing the estimated regression coefficients and robust standard errors to be compared.
+
+Measurements were collected at weeks 1, 2, and 4, which are not equally spaced. In this implementation, the AR(1) structure is interpreted in terms of consecutive measurement occasions rather than actual elapsed time in weeks. This distinction is important when interpreting the working correlation assumptions.
+
+### Hypothesis Testing and Statistical Inference
+
+The primary hypothesis test evaluates whether the relative
+treatment effect changes over time. This is assessed using
+the drug-by-time interaction coefficient.
+
+The null and alternative hypotheses are:
+
+$$
+H_0: \beta_{drug:time} = 0
+$$
+
+$$
+H_A: \beta_{drug:time} \neq 0
+$$
+
+Under the null hypothesis, the treatment odds ratio remains
+constant over time. Under the alternative hypothesis, the
+relative treatment effect changes over time.
+
+A two-sided Wald test is conducted using the robust standard
+error of the interaction coefficient. The primary significance
+level is set at $\alpha = 0.01$.
+
+The Wald statistic is calculated as:
+
+$$
+W = \left(
+\frac{\hat{\beta}_{drug:time}}
+{\widehat{SE}(\hat{\beta}_{drug:time})}
+\right)^2
+$$
+
+Under the null hypothesis, this statistic follows an
+asymptotic chi-square distribution with one degree of
+freedom.
+
+A secondary joint Wald test evaluates whether the drug
+and drug-by-time interaction coefficients are
+simultaneously equal to zero.
+
+The hypotheses are:
+
+$$
+H_0: \beta_{drug} = \beta_{drug:time} = 0
+$$
+
+$$
+H_A: \text{At least one coefficient is nonzero}
+$$
+
+The test uses the robust covariance matrix from the
+AR(1) GEE model. Under the null hypothesis, the joint
+Wald statistic follows an asymptotic chi-square
+distribution with two degrees of freedom.
+
+The joint test is evaluated at the 1% significance level.
+
+Secondary analyses evaluate the treatment effect at each
+follow-up week using the hypotheses:
+
+$$
+H_0: \beta_{drug} + t\beta_{drug:time} = 0
+$$
+
+$$
+H_A: \beta_{drug} + t\beta_{drug:time} \neq 0
+$$
+
+These hypotheses test whether the treatment odds ratio
+equals 1 at a given follow-up week.
+
+The secondary analyses use 95% Wald confidence intervals
+for the estimated odds ratios, corresponding to individual
+two-sided tests at the 5% significance level. These
+comparisons are exploratory and are not adjusted for
+multiple testing.
+
+
+## Model Results and Comparison
+
+### Model Estimates
+
+```{r models, include=FALSE}
+gee_ind  <- fit_gee(depression_data, "independence")
+gee_exch <- fit_gee(depression_data, "exchangeable")
+gee_ar1  <- fit_gee(depression_data, "ar1")
+summary(gee_ind)
+summary(gee_exch)
+summary(gee_ar1)
+```
+
+```{r coefficient-comparison}
+models <- list(
+  Independence = gee_ind,
+  Exchangeable = gee_exch,
+  AR1 = gee_ar1
+)
+
+comparison <- do.call(
+  rbind,
+  lapply(names(models), function(name) {
+    out <- as.data.frame(
+      summary(models[[name]])$coefficients
+    )
+
+    data.frame(
+      Model = name,
+      Predictor = rownames(out),
+      Estimate = out$Estimate,
+      Robust_SE = out$Std.err,
+      P_Value = out$`Pr(>|W|)`,
+      row.names = NULL
+    )
+  })
+)
+
+comparison_display <- comparison
+
+comparison_display$P_Value <- format.pval(
+  comparison_display$P_Value,
+  digits = 3,
+  eps = 1e-16
+)
+
+knitr::kable(
+  comparison_display,
+  digits = 4,
+  col.names = c(
+    "Model",
+    "Predictor",
+    "Estimate",
+    "Robust SE",
+    "p-value"
+  ),
+  caption = "GEE Coefficient Estimates Across Working Correlation Structures"
+)
+
+```
+
+### Joint Wald Test of Treatment Effects
+
+```{r joint wald test}
+# Extract treatment-related coefficients
+beta <- coef(gee_ar1)
+V <- vcov(gee_ar1)
+
+terms <- c("drug", "drug:time")
+
+beta_joint <- beta[terms]
+V_joint <- V[terms, terms]
+
+# Joint Wald statistic
+wald_stat <- as.numeric(
+  t(beta_joint) %*%
+    solve(V_joint) %*%
+    beta_joint
+)
+
+# Two restrictions
+df <- length(terms)
+
+# Chi-square p-value
+p_value <- pchisq(
+  wald_stat,
+  df = df,
+  lower.tail = FALSE
+)
+
+
+joint_wald_results <- data.frame(
+  Wald_Statistic = wald_stat,
+  DF = df,
+  P_Value = p_value
+)
+
+joint_wald_results$P_Value <- format.pval(
+  joint_wald_results$P_Value,
+  digits = 3,
+  eps = 1e-16
+)
+
+knitr::kable(
+  joint_wald_results,
+  digits = 4,
+  col.names = c(
+    "Wald Statistic",
+    "Degrees of Freedom",
+    "p-value"
+  ),
+  caption = "Joint Wald Test of Treatment Related Coefficients",
+  align = "c"
+)
+```
+
+A joint Wald test was conducted to evaluate whether the drug and drug-by-time interaction coefficients were simultaneously equal to zero.
+
+The test produced a Wald chi-square statistic of 56.9 with 2 degrees of freedom and a p-value of \(4.39\times10^{-13}\). At the 1% significance level, the null hypothesis is rejected.
+
+This provides strong evidence that the treatment-related terms jointly contribute to the model, indicating that the new and standard treatments do not have identical modeled outcome trajectories over time after accounting for baseline severity.
+
+### Sensitivity to Working Correlation Structure
+
+```{r correlation-comparison}
+correlation_comparison <- data.frame(
+  Model = c("Independence", "Exchangeable", "AR(1)"),
+  Estimated_Correlation = c(
+    0,
+    gee_exch$geese$alpha,
+    gee_ar1$geese$alpha
+  )
+)
+
+knitr::kable(
+  correlation_comparison,
+  digits = 5,
+  caption = "Estimated Working Correlation Parameters"
+)
+```
+
+The three GEE models produced nearly identical regression coefficient estimates and statistical conclusions despite using different working correlation structures.
+
+The estimated within-patient correlation was approximately -0.00444 under the exchangeable structure and 0.00519 under the AR(1) structure. Both estimates are close to zero, indicating that the fitted working correlation matrices are approximately equal to the independence correlation matrix.
+
+Consequently, the estimated regression coefficients and robust standard errors are relatively insensitive to the choice of working correlation structure in this analysis.
+
+The drug-by-time interaction is statistically significant at the 1% level across all three working correlation structures. Using the AR(1) model, the interaction coefficient is approximately 0.7079, with a Wald p-value of approximately \(2.0\times10^{-7}\). Therefore, we reject the primary null hypothesis that the treatment odds ratio remains constant over time.
+
+The positive interaction coefficient indicates that the relative odds of a normal outcome become increasingly favorable for the new drug as follow-up time increases. This conclusion is consistent across the independence, exchangeable, and AR(1) models.
+
+## Time-Specific Treatment Effects
+
+Because the GEE model includes an interaction between treatment and time, the estimated treatment effect depends on the follow-up week.
+
+Using the AR(1) model, the estimated log-odds ratio comparing the new drug with the standard drug at time \(t\) is:
+
+\[
+\widehat{\log(OR_t)} =
+\hat{\beta}_{drug} + t\hat{\beta}_{drug:time}.
+\]
+
+Exponentiating this expression gives the estimated treatment odds ratio:
+
+\[
+\widehat{OR_t} =
+\exp(\hat{\beta}_{drug} + t\hat{\beta}_{drug:time}).
+\]
+
+Treatment effects are estimated at weeks 1, 2, and 4. Confidence intervals are calculated using the robust covariance matrix of the fitted GEE model to account for uncertainty in both the drug coefficient and its interaction with time.
+
+```{r treatment-effects}
+# Follow-up weeks
+weeks <- c(1, 2, 4)
+
+# Extract coefficients and robust covariance matrix
+beta <- coef(gee_ar1)
+V <- vcov(gee_ar1)
+
+# Construct linear contrasts for the drug effect
+L <- matrix(
+  0,
+  nrow = length(weeks),
+  ncol = length(beta),
+  dimnames = list(NULL, names(beta))
+)
+
+L[, "drug"] <- 1
+L[, "drug:time"] <- weeks
+
+# Estimated log-odds ratios
+log_or <- as.vector(L %*% beta)
+
+# Robust standard errors of the contrasts
+se_log_or <- sqrt(diag(L %*% V %*% t(L)))
+
+# 95% Wald confidence intervals
+z <- qnorm(0.975)
+
+treatment_effects <- data.frame(
+  Week = weeks,
+  Log_Odds_Ratio = log_or,
+  Odds_Ratio = exp(log_or),
+  CI_Lower = exp(log_or - z * se_log_or),
+  CI_Upper = exp(log_or + z * se_log_or)
+)
+
+knitr::kable(
+  treatment_effects,
+  digits = 3,
+  col.names = c(
+    "Week",
+    "Log-odds ratio",
+    "Odds ratio",
+    "95% CI lower",
+    "95% CI upper"
+  ),
+  caption = "Time-Specific Treatment Odds Ratios with 95% Confidence Intervals",
+  align = "c"
+)
+```
+
+The estimated treatment effect increases substantially over the follow-up period. At week 1, the estimated odds ratio is 1.07 (95% CI: 0.71–1.60), indicating little evidence of a difference between treatments. Because the confidence interval includes 1, the treatment difference is not statistically significant at the 5% level.
+
+At week 2, the estimated odds ratio is 2.17 (95% CI: 1.62–2.91), indicating that the odds of a normal outcome are approximately 2.17 times as high for patients receiving the new drug compared with the standard drug. At week 4, the estimated odds ratio increases to 8.93 (95% CI: 4.93–16.19).
+
+The confidence intervals for weeks 2 and 4 exclude 1, indicating statistically significant treatment differences at the 5% level. Overall, these results suggest that the new drug becomes increasingly favorable relative to the standard drug over time.
+
+### Treatment Effect Visualization
+
+```{r treatment-plot}
+treatment_plot <- ggplot(
+  treatment_effects,
+  aes(
+    x = factor(Week),
+    y = Odds_Ratio
+  )
+) +
+  geom_hline(
+    yintercept = 1,
+    linetype = "dashed",
+    color = "gray55",
+    linewidth = 0.6
+  ) +
+  geom_errorbar(
+    aes(
+      ymin = CI_Lower,
+      ymax = CI_Upper
+    ),
+    width = 0.15,
+    linewidth = 0.9,
+    color = "#6BAED6"
+  ) +
+  geom_point(
+    size = 3.5,
+    color = "#174A7E"
+  ) +
+  coord_flip() +
+  scale_y_log10(
+    breaks = c(0.5, 1, 2, 5, 10, 20)
+  ) +
+  labs(
+    title = "Treatment Effect by Follow-Up Week",
+    subtitle = "AR(1) GEE model | 95% confidence intervals",
+    x = "Follow-Up Week",
+    y = "Odds Ratio (New vs. Standard Drug)",
+    caption = "Dashed line indicates no treatment difference (OR = 1)."
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(
+      face = "bold",
+      size = 15,
+      color = "#17324D"
+    ),
+    plot.subtitle = element_text(
+      color = "gray40"
+    ),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_blank(),
+    axis.title = element_text(
+      face = "bold"
+    ),
+    plot.caption = element_text(
+      color = "gray45",
+      hjust = 0
+    )
+  )
+
+print(treatment_plot)
+```
+
+The figure illustrates the increasing estimated treatment effect over the follow-up period. At week 1, the confidence interval crosses the null value of 1, indicating insufficient evidence of a difference between treatments at the 5% significance level. At weeks 2 and 4, the confidence intervals lie entirely above 1, indicating significantly higher odds of a normal outcome for patients receiving the new drug.
+
+The increasing odds ratios are consistent with the positive treatment-by-time interaction estimated in the GEE model.
+
+## Discussion and Limitations
+
+The analysis provides evidence that the relative effectiveness of the new depression treatment changes over time. Across all three GEE models, the drug-by-time interaction is positive and statistically significant, suggesting that the new drug becomes increasingly favorable compared with the standard treatment over the follow-up period.
+
+The AR(1) model estimates treatment odds ratios of 1.07, 2.17, and 8.93 at weeks 1, 2, and 4, respectively. The 95% confidence interval for the week 1 treatment effect includes 1, while those for weeks 2 and 4 exclude 1. These results suggest that the treatment advantage becomes more pronounced during later follow-up visits.
+
+The regression estimates are nearly identical across the independence, exchangeable, and AR(1) working correlation structures. Both estimated correlation parameters are close to zero, suggesting that the statistical conclusions are relatively insensitive to the working correlation assumption in this dataset.
+
+**Limitations**
+
+Several limitations should be considered when interpreting these findings.
+
+First, the analysis covers only four weeks of treatment, so the results cannot establish whether the observed treatment advantage persists over longer periods.
+
+Second, the outcome is binary, distinguishing normal from abnormal depression status. This does not capture the full range of possible changes in depression severity.
+
+Third, although GEE accounts for potential within-patient correlation, its estimates depend on the specified mean model and assumptions underlying the analysis. Additionally, the AR(1) structure treats the three follow-up visits as consecutive measurement occasions despite their unequal spacing in calendar time.
+
+Finally, the reported treatment effects are population-averaged odds ratios. They should not be interpreted as individual patient probabilities or guarantees of treatment success.
+
+## Conclusion
+
+This project analyzed longitudinal clinical trial data using logistic Generalized Estimating Equations to evaluate the effectiveness of a new depression treatment relative to a standard treatment.
+
+The analysis found a statistically significant treatment-by-time interaction, indicating that the relative treatment effect changed over the four-week follow-up period. The estimated odds ratios increased from 1.07 at week 1 to 2.17 at week 2 and 8.93 at week 4, suggesting an increasingly favorable effect of the new drug on the odds of a normal depression outcome.
+
+The independence, exchangeable, and AR(1) models produced nearly identical coefficient estimates and statistical conclusions, demonstrating that the findings were relatively insensitive to the choice of working correlation structure.
+
+Overall, the results support an increasing relative treatment advantage over the observed follow-up period while highlighting the importance of accounting for repeated measurements and evaluating modeling assumptions in longitudinal statistical analysis.
+
+## Reproducibility and References
+
+This analysis was conducted in R using a reproducible
+R Markdown workflow. Data preparation and GEE model
+fitting are implemented in reusable functions stored
+in `R/modeling.R`.
+
+### Data Source
+
+The clinical trial dataset was obtained from Alan
+Agresti's categorical data repository:
+
+[Depression.dat](https://github.com/alanagresti/categorical-data/blob/master/Depression.dat)
+
+The dataset contains repeated binary depression
+outcomes from patients receiving either a new drug
+or a standard treatment.
+
+### Software and Dependencies
+
+The analysis uses the following R packages:
+
+- `geepack` — Generalized Estimating Equations
+- `dplyr` — Data manipulation and summarization
+- `ggplot2` — Statistical visualizations
+- `knitr` — Report generation and formatted tables
+- `scales` — Percentage formatting for plots
+
+### Reproducing the Analysis
+
+To reproduce the analysis:
+
+1. Download or clone the GitHub repository.
+2. Open `analysis.Rmd` in RStudio.
+3. Install the required R packages.
+4. Knit the R Markdown document to HTML.
+
+The dataset is retrieved directly from its source,
+and the analysis code generates the statistical
+models, tables, and visualizations.
